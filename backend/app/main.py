@@ -1,16 +1,30 @@
-import json
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.modules.seal_snapshot import write_pack, pinned_pack, pack_summary, list_weeks_with_pin
+from app.modules.seal_guard import SealedWriteError, ensure_week_writable
+from app.modules.seal_diff import week_diff
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
 def _startup(): seed.init_db()
+
+@app.exception_handler(SealedWriteError)
+def _sealed_write(_, exc: SealedWriteError):
+    return JSONResponse(status_code=409, content={"detail": "week_sealed"})
+
+def _week_or_404(c, week_id: int):
+    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
+    if not week:
+        c.close(); raise HTTPException(404, "week not found")
+    return week
 
 @app.get("/api/health")
 def health(): return {"ok": True, "project": "chorerota"}
@@ -39,30 +53,35 @@ def add_task(body: dict):
 
 @app.get("/api/weeks")
 def list_weeks():
-    c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM weeks")]; c.close(); return rows
+    c = connect(); rows = list_weeks_with_pin(c); c.close(); return rows
 
 @app.get("/api/weeks/{week_id}/board")
 def week_board(week_id: int):
     c = connect()
-    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
-    if not week: c.close(); raise HTTPException(404, "week not found")
+    week = _week_or_404(c, week_id)
     assigns = [dict(r) for r in c.execute("SELECT * FROM assignments WHERE week_id=?", (week_id,))]
     members = {r["id"]: r["name"] for r in c.execute("SELECT id,name FROM members")}
     tasks = {r["id"]: r["title"] for r in c.execute("SELECT id,title FROM tasks")}
+    pack = pinned_pack(c, week_id)
     c.close()
     for a in assigns:
         a["member_name"] = members.get(a["member_id"], "?")
         a["task_title"] = tasks.get(a["task_id"], "?")
-    return {"week": dict(week), "assignments": assigns}
+    return {"week": dict(week), "assignments": assigns,
+            "pack": pack_summary(pack) if pack else None}
 
 class GenBody(BaseModel):
     days: int = 7
+    force: bool = False
 
 @app.post("/api/weeks/{week_id}/generate")
 def generate(week_id: int, body: GenBody = GenBody()):
     c = connect()
-    week = c.execute("SELECT * FROM weeks WHERE id=?", (week_id,)).fetchone()
-    if not week: c.close(); raise HTTPException(404, "week not found")
+    week = _week_or_404(c, week_id)
+    ensure_week_writable(week)
+    existing = c.execute("SELECT COUNT(*) n FROM assignments WHERE week_id=?", (week_id,)).fetchone()["n"]
+    if existing and not body.force:
+        c.close(); raise HTTPException(409, "already_generated")
     mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
     tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
     slots = build_week_slots(mids, tids, days=body.days)
@@ -73,6 +92,47 @@ def generate(week_id: int, body: GenBody = GenBody()):
     c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
     c.commit(); c.close()
     return {"count": len(slots), "slots": slots}
+
+@app.post("/api/weeks/{week_id}/seal")
+def seal_week(week_id: int):
+    c = connect()
+    week = _week_or_404(c, week_id)
+    if week["status"] != "ready":
+        c.close(); raise HTTPException(409, "not_ready")
+    assigns = [dict(r) for r in c.execute(
+        "SELECT day,task_id,member_id FROM assignments WHERE week_id=?", (week_id,))]
+    pack = write_pack(c, week_id, assigns, datetime.now(timezone.utc).isoformat())
+    c.commit(); summary = pack_summary(pack); c.close()
+    return {"ok": True, "pack": summary}
+
+@app.post("/api/weeks/{week_id}/unseal")
+def unseal_week(week_id: int):
+    c = connect()
+    week = _week_or_404(c, week_id)
+    if week["status"] != "sealed":
+        c.close(); raise HTTPException(409, "not_sealed")
+    # 解封只回状态，钉住的包不动，供随后 force 重生成做对照
+    c.execute("UPDATE weeks SET status='ready' WHERE id=?", (week_id,))
+    c.commit(); c.close()
+    return {"ok": True}
+
+@app.get("/api/weeks/{week_id}/pack")
+def week_pack(week_id: int):
+    c = connect()
+    _week_or_404(c, week_id)
+    pack = pinned_pack(c, week_id)
+    c.close()
+    if not pack: raise HTTPException(404, "no_pinned_pack")
+    return pack
+
+@app.get("/api/weeks/{week_id}/diff")
+def week_diff_view(week_id: int):
+    c = connect()
+    _week_or_404(c, week_id)
+    diff = week_diff(c, week_id)
+    c.close()
+    if diff is None: raise HTTPException(404, "no_pinned_pack")
+    return diff
 
 class SwapBody(BaseModel):
     a_day: int; a_task: int; b_day: int; b_task: int; note: str = ""
@@ -94,13 +154,18 @@ def request_swap(week_id: int, body: SwapBody):
 def list_swaps():
     c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM swap_requests ORDER BY id DESC")]; c.close(); return rows
 
-@app.post("/api/swaps/{swap_id}/confirm")
-def confirm_swap(swap_id: int):
-    c = connect()
+def _pending_swap_or_400(c, swap_id: int):
     sw = c.execute("SELECT * FROM swap_requests WHERE id=?", (swap_id,)).fetchone()
     if not sw: c.close(); raise HTTPException(404, "swap not found")
     if sw["status"] != "pending":
         c.close(); raise HTTPException(400, "not_pending")
+    return sw
+
+@app.post("/api/swaps/{swap_id}/confirm")
+def confirm_swap(swap_id: int):
+    c = connect()
+    sw = _pending_swap_or_400(c, swap_id)
+    ensure_week_writable(_week_or_404(c, sw["week_id"]))
     assigns = [dict(r) for r in c.execute(
         "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
     slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
@@ -114,12 +179,22 @@ def confirm_swap(swap_id: int):
     c.commit(); c.close()
     return {"ok": True, "swap_id": swap_id}
 
+@app.post("/api/swaps/{swap_id}/cancel")
+def cancel_swap(swap_id: int):
+    c = connect()
+    sw = _pending_swap_or_400(c, swap_id)
+    ensure_week_writable(_week_or_404(c, sw["week_id"]))
+    c.execute("UPDATE swap_requests SET status='cancelled' WHERE id=?", (swap_id,))
+    c.commit(); c.close()
+    return {"ok": True, "swap_id": swap_id}
+
 @app.get("/api/settings")
 def get_settings():
     c = connect(); rows = {r["key"]: r["value"] for r in c.execute("SELECT * FROM settings")}; c.close(); return rows
 
 @app.put("/api/settings")
 def put_settings(body: dict):
+    # 只写 settings 表：改家庭名等设置不得解封周、不得改差分包
     c = connect()
     for k, v in body.items():
         c.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))

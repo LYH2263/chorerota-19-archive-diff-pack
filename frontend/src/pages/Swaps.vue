@@ -15,6 +15,7 @@
         #{{ s.id }} D{{ s.a_day }}/T{{ s.a_task }} ↔ D{{ s.b_day }}/T{{ s.b_task }}
         <span class="chip" :class="{ coral: s.status==='pending' }">{{ s.status }}</span>
         <button v-if="s.status==='pending'" style="margin-left:8px" @click="confirm(s.id)">确认改表</button>
+        <button v-if="s.status==='pending'" class="ghost" style="margin-left:8px" @click="cancel(s.id)">撤销</button>
       </li>
     </ul>
   </div>
@@ -36,6 +37,11 @@ async function request() {
 async function confirm(id) {
   err.value = ''
   try { await api('/swaps/' + id + '/confirm', { method: 'POST', body: '{}' }); await load() }
+  catch (e) { err.value = e.message }
+}
+async function cancel(id) {
+  err.value = ''
+  try { await api('/swaps/' + id + '/cancel', { method: 'POST', body: '{}' }); await load() }
   catch (e) { err.value = e.message }
 }
 onMounted(load)

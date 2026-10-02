@@ -49,3 +49,7 @@ input, select, textarea {
 .list { padding: 0; margin: 0; }
 .muted { color: var(--muted); font-size: 13px; }
 .err { color: #b33a2c; }
+.week-strip { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.week-tab { min-height: 0; cursor: pointer; padding: 8px 12px; }
+.week-tab.active { border-color: var(--coral); box-shadow: 0 0 0 1px var(--coral); }
+button:disabled { opacity: .5; cursor: not-allowed; }

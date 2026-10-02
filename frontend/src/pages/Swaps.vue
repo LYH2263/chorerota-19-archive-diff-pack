@@ -12,9 +12,10 @@
     <p v-if="err" class="err">{{ err }}</p>
     <ul class="list">
       <li v-for="s in rows" :key="s.id">
-        #{{ s.id }} D{{ s.a_day }}/T{{ s.a_task }} ↔ D{{ s.b_day }}/T{{ s.b_task }}
         <span class="chip" :class="{ coral: s.status==='pending' }">{{ s.status }}</span>
+        #{{ s.id }} 周{{ s.week_id }} · D{{ s.a_day }}/T{{ s.a_task }} ↔ D{{ s.b_day }}/T{{ s.b_task }}
         <button v-if="s.status==='pending'" style="margin-left:8px" @click="confirm(s.id)">确认改表</button>
+        <button v-if="s.status==='pending'" class="ghost" style="margin-left:4px" @click="revoke(s.id)">撤销</button>
       </li>
     </ul>
   </div>
@@ -36,7 +37,17 @@ async function request() {
 async function confirm(id) {
   err.value = ''
   try { await api('/swaps/' + id + '/confirm', { method: 'POST', body: '{}' }); await load() }
-  catch (e) { err.value = e.message }
+  catch (e) { err.value = friendly(e.message) }
+}
+async function revoke(id) {
+  err.value = ''
+  try { await api('/swaps/' + id + '/revoke', { method: 'POST', body: '{}' }); await load() }
+  catch (e) { err.value = friendly(e.message) }
+}
+function friendly(msg) {
+  if (msg === 'week_sealed') return '该周已封存：对调确认与撤销均被禁止，请先在看板页解封。'
+  if (msg === 'not_pending') return '该对调已非待处理状态。'
+  return msg
 }
 onMounted(load)
 </script>
